@@ -1,9 +1,17 @@
-from llm import call_llm
 import numpy as np
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Set
 from sklearn.decomposition import PCA, TruncatedSVD
 from sklearn.manifold import TSNE
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from sentence_transformers import SentenceTransformer
 import json
+import re
+from collections import Counter
+from llm import call_llm
+
+# Load sentence transformer for semantic similarity
+sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
 
 
 # ============================================
@@ -98,7 +106,7 @@ def compress_embeddings_batch(
 
 def summarize_extractive(contexts: List[Dict[str, Any]], max_sentences: int = 5) -> str:
     """
-    Extractive summarization: select most important sentences.
+    Extractive summarization using TF-IDF and sentence embeddings.
     
     Args:
         contexts: List of context dictionaries
@@ -108,24 +116,61 @@ def summarize_extractive(contexts: List[Dict[str, Any]], max_sentences: int = 5)
         Extracted summary
     """
     all_text = "\n".join(c.get("content", "") for c in contexts)
-    sentences = [s.strip() for s in all_text.split('.') if s.strip()]
     
-    # Simple heuristic: prioritize longer, information-rich sentences
-    scored_sentences = []
-    for sent in sentences:
-        score = len(sent.split())  # Word count as simple score
-        scored_sentences.append((score, sent))
+    # Split into sentences
+    sentences = re.split(r'[.!?]+', all_text)
+    sentences = [s.strip() for s in sentences if s.strip() and len(s.strip().split()) > 3]
     
-    # Sort by score and take top sentences
-    scored_sentences.sort(reverse=True)
-    top_sentences = [sent for _, sent in scored_sentences[:max_sentences]]
+    if not sentences:
+        return ""
+    
+    if len(sentences) <= max_sentences:
+        return ". ".join(sentences) + "."
+    
+    try:
+        # Use TF-IDF to score sentences
+        vectorizer = TfidfVectorizer(stop_words='english', max_features=100)
+        tfidf_matrix = vectorizer.fit_transform(sentences)
+        
+        # Calculate sentence importance scores
+        sentence_scores = []
+        for idx, sentence in enumerate(sentences):
+            # TF-IDF score
+            tfidf_score = tfidf_matrix[idx].sum()
+            
+            # Length bonus (information density)
+            length_bonus = min(len(sentence.split()) / 20.0, 1.0)
+            
+            # Position bonus (earlier sentences often more important)
+            position_bonus = 1.0 / (idx + 1) ** 0.5
+            
+            total_score = tfidf_score + length_bonus + position_bonus
+            sentence_scores.append((total_score, idx, sentence))
+        
+        # Sort by score and select top sentences
+        sentence_scores.sort(reverse=True)
+        
+        # Take top sentences but maintain original order
+        selected = sorted(sentence_scores[:max_sentences], key=lambda x: x[1])
+        top_sentences = [sent for _, _, sent in selected]
+        
+    except Exception:
+        # Fallback: use simple word count heuristic
+        scored_sentences = []
+        for idx, sent in enumerate(sentences):
+            score = len(sent.split())
+            scored_sentences.append((score, idx, sent))
+        
+        scored_sentences.sort(reverse=True)
+        selected = sorted(scored_sentences[:max_sentences], key=lambda x: x[1])
+        top_sentences = [sent for _, _, sent in selected]
     
     return ". ".join(top_sentences) + "."
 
 
 def summarize_abstractive(contexts: List[Dict[str, Any]], max_length: int = 200) -> str:
     """
-    Abstractive summarization using LLM.
+    Abstractive-style summarization using TextRank with sentence transformers.
     
     Args:
         contexts: List of context dictionaries
@@ -134,32 +179,68 @@ def summarize_abstractive(contexts: List[Dict[str, Any]], max_length: int = 200)
     Returns:
         Generated summary
     """
-    original_text = "\n\n".join(c.get("content", "") for c in contexts)
+    all_text = "\n\n".join(c.get("content", "") for c in contexts)
     
-    if not original_text.strip():
+    if not all_text.strip():
         return ""
     
-    prompt = f"""
-Summarize the following context in approximately {max_length} words.
-Focus on key facts, entities, and relationships.
-Be concise but preserve important details.
-
-Context:
-{original_text}
-
-Summary:"""
-
-    summary = call_llm([
-        {"role": "system", "content": "You are an expert at creating concise, informative summaries."},
-        {"role": "user", "content": prompt}
-    ])
-
-    return summary.strip()
+    # Split into sentences
+    sentences = re.split(r'[.!?]+', all_text)
+    sentences = [s.strip() for s in sentences if s.strip() and len(s.strip().split()) > 3]
+    
+    if not sentences:
+        return ""
+    
+    if len(sentences) <= 3:
+        return ". ".join(sentences) + "."
+    
+    try:
+        # Generate sentence embeddings
+        embeddings = sentence_model.encode(sentences)
+        
+        # Calculate similarity matrix
+        similarity_matrix = cosine_similarity(embeddings)
+        
+        # Apply TextRank algorithm (PageRank on sentence similarity graph)
+        scores = np.ones(len(sentences))
+        damping = 0.85
+        
+        for _ in range(10):  # 10 iterations
+            new_scores = np.ones(len(sentences)) * (1 - damping)
+            for i in range(len(sentences)):
+                for j in range(len(sentences)):
+                    if i != j and similarity_matrix[i][j] > 0:
+                        new_scores[i] += damping * similarity_matrix[i][j] * scores[j] / similarity_matrix[j].sum()
+            scores = new_scores
+        
+        # Select sentences until we reach max_length
+        ranked_indices = np.argsort(scores)[::-1]
+        selected_sentences = []
+        word_count = 0
+        
+        for idx in ranked_indices:
+            sentence = sentences[idx]
+            words = len(sentence.split())
+            if word_count + words <= max_length:
+                selected_sentences.append((idx, sentence))
+                word_count += words
+            if word_count >= max_length * 0.9:  # Allow 10% margin
+                break
+        
+        # Sort by original order
+        selected_sentences.sort(key=lambda x: x[0])
+        summary = ". ".join([sent for _, sent in selected_sentences])
+        
+        return summary + "." if summary else ""
+        
+    except Exception as e:
+        # Fallback to extractive
+        return summarize_extractive(contexts, max_sentences=min(5, max_length // 30))
 
 
 def summarize_hierarchical(contexts: List[Dict[str, Any]], levels: int = 2) -> str:
     """
-    Hierarchical summarization: summarize in multiple passes.
+    Hierarchical summarization using progressive extractive compression.
     
     Args:
         contexts: List of context dictionaries
@@ -171,27 +252,24 @@ def summarize_hierarchical(contexts: List[Dict[str, Any]], levels: int = 2) -> s
     if not contexts:
         return ""
     
-    current_text = "\n\n".join(c.get("content", "") for c in contexts)
+    current_contexts = contexts
     
     for level in range(levels):
-        compression_ratio = 0.5 ** (level + 1)  # Each level compresses by half
-        target_words = max(50, int(len(current_text.split()) * compression_ratio))
+        # Calculate target sentence count for this level
+        all_text = "\n\n".join(c.get("content", "") for c in current_contexts)
+        sentences = re.split(r'[.!?]+', all_text)
+        sentence_count = len([s for s in sentences if s.strip()])
         
-        prompt = f"""
-Summarize the following text in approximately {target_words} words.
-Level {level + 1} of {levels}.
-
-Text:
-{current_text}
-
-Summary:"""
-
-        current_text = call_llm([
-            {"role": "system", "content": "You create multi-level summaries."},
-            {"role": "user", "content": prompt}
-        ])
+        # Compress by half each level
+        target_sentences = max(3, sentence_count // (2 ** (level + 1)))
+        
+        # Apply extractive summarization
+        summary = summarize_extractive(current_contexts, max_sentences=target_sentences)
+        
+        # Update contexts for next level
+        current_contexts = [{"content": summary}]
     
-    return current_text.strip()
+    return current_contexts[0]["content"] if current_contexts else ""
 
 
 # ============================================
