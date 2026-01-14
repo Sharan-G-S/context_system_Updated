@@ -107,6 +107,7 @@ def compress_embeddings_batch(
 def summarize_extractive(contexts: List[Dict[str, Any]], max_sentences: int = 5) -> str:
     """
     Extractive summarization using TF-IDF and sentence embeddings.
+    Only compresses if content is verbose enough to warrant compression.
     
     Args:
         contexts: List of context dictionaries
@@ -124,6 +125,7 @@ def summarize_extractive(contexts: List[Dict[str, Any]], max_sentences: int = 5)
     if not sentences:
         return ""
     
+    # If already concise, return as-is
     if len(sentences) <= max_sentences:
         return ". ".join(sentences) + "."
     
@@ -171,13 +173,14 @@ def summarize_extractive(contexts: List[Dict[str, Any]], max_sentences: int = 5)
 def summarize_abstractive(contexts: List[Dict[str, Any]], max_length: int = 200) -> str:
     """
     Abstractive-style summarization using TextRank with sentence transformers.
+    Only compresses if content exceeds the target length and complexity threshold.
     
     Args:
         contexts: List of context dictionaries
         max_length: Maximum length of summary in words
         
     Returns:
-        Generated summary
+        Generated summary (or original if already concise)
     """
     all_text = "\n\n".join(c.get("content", "") for c in contexts)
     
@@ -191,7 +194,9 @@ def summarize_abstractive(contexts: List[Dict[str, Any]], max_length: int = 200)
     if not sentences:
         return ""
     
-    if len(sentences) <= 3:
+    # Check if content is already concise
+    word_count = sum(len(s.split()) for s in sentences)
+    if len(sentences) <= 3 or word_count <= max_length:
         return ". ".join(sentences) + "."
     
     try:
@@ -460,6 +465,7 @@ def compress_context(
 ) -> Tuple[List[Dict[str, str]], str]:
     """
     Compress contexts using various methods.
+    Intelligently determines if compression is needed based on content length and structure.
     
     Args:
         contexts: List of context dictionaries
@@ -471,6 +477,17 @@ def compress_context(
         Tuple of (compressed contexts, original text)
     """
     original_text = "\n\n".join(c.get("content", "") for c in contexts)
+    
+    # Check if compression is needed
+    total_words = len(original_text.split())
+    total_sentences = len([s for s in re.split(r'[.!?]+', original_text) if s.strip()])
+    
+    # Don't compress if content is already concise (single sentence or < 50 words)
+    if total_sentences <= 2 or total_words < 50:
+        return (
+            [{"role": "system", "content": original_text}],
+            original_text
+        )
     
     # Apply dimensionality reduction if requested
     processed_contexts = contexts
