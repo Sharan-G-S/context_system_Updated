@@ -360,7 +360,7 @@ The system will show retrieved context and generated responses.
 
 ## License
 
-[Add your license information here]
+[MIT](https://opensource.org/licenses/MIT)
 
 ## Acknowledgments
 
